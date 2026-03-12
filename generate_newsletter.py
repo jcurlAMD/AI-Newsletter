@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import openai
+import git
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
@@ -38,10 +39,13 @@ from reportlab.platypus import (
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 
 # ---------------------------------------------------------------------------
-# CONFIG
+# CONFIG — edit these values before running
 # ---------------------------------------------------------------------------
-API_KEY         = os.environ.get("PROJECT_API_KEY", "PASTE_YOUR_AMD_GATEWAY_KEY_HERE")
-OUTPUT_DIR      = Path("newsletters")
+API_KEY         = "PASTE_YOUR_AMD_GATEWAY_KEY_HERE"
+REPO_PATH       = r"C:\Users\lucasb\AI-Newsletter"   # Local path to your cloned repo
+OUTPUT_DIR      = Path(REPO_PATH) / "newsletters"
+GIT_REMOTE      = "origin"
+GIT_BRANCH      = "main"
 MODEL           = "GPT-oss-20B"
 MAX_TOKENS      = 3500
 TEMPERATURE     = 0.5
@@ -391,22 +395,66 @@ def build_pdf(sections: dict, output_path: Path, date_str: str) -> None:
     log.info("PDF saved: %s (%.1f KB)", output_path, output_path.stat().st_size / 1024)
 
 
+def commit_and_push(output_path: Path, file_date: str) -> None:
+    """Commit the newsletter PDF and push to GitHub."""
+    repo = git.Repo(REPO_PATH)
+
+    abs_path = str(output_path)
+    repo.index.add([abs_path])
+    log.info("Staged: %s", abs_path)
+
+    try:
+        staged_diff = repo.index.diff("HEAD")
+        has_changes = len(staged_diff) > 0
+    except Exception:
+        has_changes = True
+
+    if not has_changes:
+        untracked = repo.untracked_files
+        has_changes = any(f"newsletters" in f for f in untracked)
+
+    if not has_changes:
+        log.info("No changes detected — newsletter already up to date.")
+        return
+
+    origin = repo.remote(name=GIT_REMOTE)
+    log.info("Pulling latest changes...")
+    origin.pull(rebase=True)
+
+    timestamp  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    commit_msg = f"chore(newsletter): publish AMD finance newsletter [{timestamp}]"
+    repo.index.commit(commit_msg)
+    log.info("Committed: %s", commit_msg)
+
+    push_result = origin.push(refspec=f"HEAD:{GIT_BRANCH}")
+    for info in push_result:
+        if info.flags & info.ERROR:
+            raise RuntimeError(f"Git push failed: {info.summary}")
+
+    log.info("Pushed to %s/%s", GIT_REMOTE, GIT_BRANCH)
+
+
 def main() -> None:
     if API_KEY == "PASTE_YOUR_AMD_GATEWAY_KEY_HERE":
-        log.error("PROJECT_API_KEY environment variable is not set.")
+        log.error("API_KEY is not set. Edit the CONFIG block at the top of this script.")
+        sys.exit(1)
+
+    if not Path(REPO_PATH).is_dir():
+        log.error("REPO_PATH does not exist: %s", REPO_PATH)
         sys.exit(1)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    date_str     = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    file_date    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    output_path  = OUTPUT_DIR / f"amd_finance_newsletter_{file_date}.pdf"
+    date_str    = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    file_date   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    output_path = OUTPUT_DIR / f"amd_finance_newsletter_{file_date}.pdf"
 
     try:
         client   = make_client()
         sections = generate_content(client, date_str)
         build_pdf(sections, output_path, date_str)
-        log.info("Done. Newsletter saved to %s", output_path)
+        commit_and_push(output_path, file_date)
+        log.info("Done. Newsletter published to %s", output_path)
     except Exception as exc:
         log.exception("Newsletter generation failed: %s", exc)
         sys.exit(1)
